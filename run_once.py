@@ -31,9 +31,11 @@ PROJ = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJ)
 os.chdir(PROJ)
 
+import tweet_card
 from twitter_watcher import TwitterWatcher
 from utils import (find_all, find_one, parse_create_time_from_tweet,
                    parse_media_from_tweet, parse_text_from_tweet)
+from tweet_card import expand_urls
 from webhook_notifier import WebhookMessage, WebhookNotifier
 
 STATE_PATH = os.path.join(PROJ, 'state.json')
@@ -72,6 +74,8 @@ def send_wecom_image(webhook: str, data: bytes) -> bool:
     """Push one image as a native WeCom image message (no external URL needed)."""
     if 'qyapi.weixin.qq.com' not in webhook:
         return False
+    if not data or len(data) > WECOM_MAX_IMAGE:
+        return False
     payload = {
         'msgtype': 'image',
         'image': {
@@ -94,28 +98,43 @@ def send_wecom_image(webhook: str, data: bytes) -> bool:
     return True
 
 
-def expand_urls(tweet: dict, text: str) -> str:
-    """Replace t.co shorteners with the real target so the reader knows where
-    a link goes without having to open it (t.co itself is unreachable in CN)."""
-    for items in find_all(tweet, 'urls'):
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            short = item.get('url')
-            full = item.get('expanded_url')
-            if short and full and short in text:
-                text = text.replace(short, full)
-    return text
-
-
 def beijing_time(tweet: dict) -> str:
     try:
         created = parse_create_time_from_tweet(tweet)
         return created.astimezone(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
     except Exception:
         return ''
+
+
+def _fit_bytes(text: str, limit: int = 1900) -> str:
+    """WeCom caps text messages at 2048 bytes of UTF-8, not 2048 characters."""
+    data = text.encode('utf-8')
+    if len(data) <= limit:
+        return text
+    return data[:limit - 12].decode('utf-8', 'ignore') + '\n…(截断)'
+
+
+def original_text(tweet: dict, target: str, tid: str) -> str:
+    """Plain-text copy of the tweet, so the reader can long-press and copy it."""
+    stamp = beijing_time(tweet)
+    lines = ['原文 @{}{}'.format(target, ' · ' + stamp if stamp else ''), '']
+
+    body = expand_urls(tweet, parse_text_from_tweet(tweet) or '').strip()
+    lines.append(body or '（此推文没有正文）')
+
+    quoted = find_one(tweet, 'quoted_status_result')
+    if isinstance(quoted, dict):
+        quoted = quoted.get('result') or quoted
+        if isinstance(quoted, dict):
+            author = find_one(quoted, 'user_results')
+            core = find_one(author, 'core') or {}
+            qhandle = core.get('screen_name') or ''
+            qtext = expand_urls(quoted, parse_text_from_tweet(quoted) or '').strip()
+            if qtext:
+                lines += ['', '【引用 @{}】'.format(qhandle), qtext]
+
+    lines += ['', 'https://x.com/{}/status/{}'.format(target, tid)]
+    return _fit_bytes('\n'.join(lines))
 
 
 def main() -> int:
@@ -179,11 +198,26 @@ def main() -> int:
     elif fresh:
         WebhookNotifier.init(logger_name='webhook')
         for tid, tweet in fresh:
+            # Preferred output: one screenshot-style card image that already
+            # contains avatar, text, media, quoted tweet and engagement counts.
+            card = None
+            try:
+                card = tweet_card.render_card(tweet, target)
+            except Exception as e:
+                print('card render failed for {}: {}'.format(tid, e))
+
+            if card and send_wecom_image(webhook, card):
+                print('pushed {} as card ({} KB)'.format(tid, len(card) // 1024))
+                # Also send the plain text so it can be copied on a phone.
+                WebhookNotifier.send_message(WebhookMessage(
+                    url_list=[webhook], text=original_text(tweet, target, tid)))
+                print('  original text sent')
+                continue
+
+            # Fallback: plain text plus the photos as separate image messages.
             text = expand_urls(tweet, parse_text_from_tweet(tweet) or '')
             photos, videos = parse_media_from_tweet(tweet)
 
-            # Download first so that any photo we cannot embed can still be
-            # mentioned as a plain URL inside the text message.
             image_blobs = []
             failed_urls = []
             for url in photos[:MAX_PHOTOS]:
@@ -203,7 +237,7 @@ def main() -> int:
             body += '\n\nhttps://x.com/{}/status/{}'.format(target, tid)
 
             WebhookNotifier.send_message(WebhookMessage(url_list=[webhook], text=body))
-            print('pushed {} ({} image(s) embedded)'.format(tid, len(image_blobs)))
+            print('pushed {} as text ({} image(s) embedded)'.format(tid, len(image_blobs)))
 
             for blob in image_blobs:
                 if send_wecom_image(webhook, blob):
