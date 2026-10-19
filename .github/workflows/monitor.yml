@@ -2,12 +2,15 @@ name: twitter-monitor
 
 on:
   schedule:
+    # GitHub's minimum granularity is 5 minutes and free runners often queue,
+    # so the effective interval is closer to 10-15 minutes.
     - cron: '*/10 * * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
+# Never let two polls overlap and race on state.json.
 concurrency:
   group: twitter-monitor
   cancel-in-progress: false
@@ -17,14 +20,33 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    # Matrix jobs share one git checkout, so run them one after another:
+    # otherwise two jobs can push state at the same moment and one is rejected.
+    concurrency:
+      group: twitter-monitor-poll
+      cancel-in-progress: false
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # To watch another account, add two more lines with its handle and a
+          # dedicated state file. Keep one state file per target.
+          - target: nikgeneburn
+            state: state.json
+          - target: tarkov
+            state: state-tarkov.json
+          # - target: another_handle
+          #   state: state-another_handle.json
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          
-            # The rendered card mixes English and Chinese, so Pillow needs a CJK font.
+
+      # The rendered card mixes English and Chinese, so Pillow needs a CJK font.
       - name: Install CJK font
         run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
 
@@ -39,7 +61,8 @@ jobs:
           X_AUTH_TOKEN: ${{ secrets.X_AUTH_TOKEN }}
           X_CT0: ${{ secrets.X_CT0 }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-          TARGET_USER: nikgeneburn
+          TARGET_USER: ${{ matrix.target }}
+          STATE_FILE: ${{ matrix.state }}
         run: python run_once.py
 
       - name: Persist state
@@ -47,10 +70,19 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json
+          git add state.json 2>/dev/null || true
+          for f in state-*.json; do
+            [ -e "$f" ] && git add "$f"
+          done
           if git diff --staged --quiet; then
             echo "state unchanged"
           else
             git commit -m "chore: update poll state [skip ci]"
-            git push
+            for attempt in 1 2 3; do
+              if git pull --rebase --autostash origin main && git push; then
+                break
+              fi
+              echo "push retry $attempt"
+              sleep 5
+            done
           fi
