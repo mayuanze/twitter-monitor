@@ -145,26 +145,96 @@ def _cjk_ratio(text: str) -> float:
     return cjk / len(text)
 
 
+BROWSER_HEADERS = {
+    'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                   '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'),
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+}
+
+
+def _google_translate(text: str, lang: str) -> str:
+    """Google web endpoint. Sends a browser UA: without it Google answers with
+    an HTML interstitial and the JSON parse fails."""
+    for host in ('translate.googleapis.com', 'translate.google.com'):
+        try:
+            response = requests.get(
+                'https://{}/translate_a/single'.format(host),
+                params={'client': 'gtx', 'sl': 'auto', 'tl': lang, 'dt': 't',
+                        'q': text[:1800]},
+                headers=BROWSER_HEADERS, timeout=30)
+        except Exception as e:
+            print('  google({}) request failed: {}'.format(host, e))
+            continue
+        if response.status_code != 200:
+            print('  google({}) HTTP {}'.format(host, response.status_code))
+            continue
+        try:
+            data = response.json()
+            return ''.join(part[0] for part in data[0] if part and part[0]).strip()
+        except Exception:
+            print('  google({}) non-JSON reply: {}'.format(
+                host, response.text[:100].replace('\n', ' ')))
+    return ''
+
+
+def _mymemory_translate(text: str, lang: str) -> str:
+    """MyMemory free tier: 500-byte query limit, so send it in chunks."""
+    pieces = []
+    for start in range(0, len(text), 400):
+        chunk = text[start:start + 400]
+        try:
+            response = requests.get(
+                'https://api.mymemory.translated.net/get',
+                params={'q': chunk, 'langpair': 'en|' + lang},
+                headers=BROWSER_HEADERS, timeout=30)
+            payload = response.json()
+        except Exception as e:
+            print('  mymemory failed: {}'.format(e))
+            return ''
+        translated = (payload.get('responseData') or {}).get('translatedText') or ''
+        if not translated or str(payload.get('responseStatus')) != '200':
+            print('  mymemory rejected: {}'.format(str(payload)[:120]))
+            return ''
+        pieces.append(translated)
+    return ''.join(pieces).strip()
+
+
+def _lingva_translate(text: str, lang: str) -> str:
+    """Lingva Translate: open-source Google front-end, no key required."""
+    for host in ('lingva.ml', 'lingva.garudalinux.org'):
+        url = 'https://{}/api/v1/auto/{}/{}'.format(
+            host, lang, requests.utils.quote(text[:1500], safe=''))
+        try:
+            response = requests.get(url, headers=BROWSER_HEADERS, timeout=30)
+        except Exception as e:
+            print('  lingva({}) failed: {}'.format(host, e))
+            continue
+        if response.status_code != 200:
+            print('  lingva({}) HTTP {}'.format(host, response.status_code))
+            continue
+        try:
+            return (response.json().get('translation') or '').strip()
+        except Exception:
+            print('  lingva({}) non-JSON reply'.format(host))
+            continue
+    return ''
+
+
 def translate(text: str, lang: str = 'zh-CN') -> str:
-    """Translate with the free Google web endpoint: no API key required."""
+    """Translate with free endpoints, trying several providers in turn."""
     if not text.strip():
         return ''
     if _cjk_ratio(text) > 0.3:
         return ''  # already Chinese, nothing to do
-    endpoints = [
-        'https://translate.googleapis.com/translate_a/single',
-        'https://translate.google.com/translate_a/single',
-    ]
-    for endpoint in endpoints:
-        try:
-            response = requests.get(endpoint, params={
-                'client': 'gtx', 'sl': 'auto', 'tl': lang, 'dt': 't',
-                'q': text[:1800],
-            }, timeout=30)
-            data = response.json()
-            return ''.join(part[0] for part in data[0] if part and part[0]).strip()
-        except Exception as e:
-            print('translate via {} failed: {}'.format(endpoint.split('/')[2], e))
+
+    for name, handler in (('google', _google_translate),
+                          ('mymemory', _mymemory_translate),
+                          ('lingva', _lingva_translate)):
+        result = handler(text, lang)
+        if result:
+            print('  translated via {}'.format(name))
+            return result
     return ''
 
 
