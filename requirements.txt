@@ -1,0 +1,11 @@
+click
+python-telegram-bot==13.15
+retry
+tzlocal==2.1
+bs4
+requests
+httpx
+XClientTransaction>=1.0.3
+brotli
+setuptools<81
+urllib3<2

@@ -1,0 +1,98 @@
+import time
+
+from monitor_base import MonitorBase
+from utils import ProfileParser, find_all, find_one, get_cursor
+
+
+class FollowingMonitor(MonitorBase):
+    monitor_type = 'Following'
+
+    def __init__(self, username: str, title: str, token_config: dict, user_config: dict, cookies_dir: str) -> None:
+        super().__init__(monitor_type=self.monitor_type,
+                         username=username,
+                         title=title,
+                         token_config=token_config,
+                         user_config=user_config,
+                         cookies_dir=cookies_dir)
+
+        self.following_dict = self.get_all_following(self.user_id)
+
+        self.logger.info('Init following monitor succeed.\nUser id: {}\nFollowing {} users: {}'.format(
+            self.user_id, len(self.following_dict),
+            [find_one(following, 'screen_name') for following in self.following_dict.values()]))
+
+    def get_all_following(self, user_id: str | int) -> dict:
+        api_name = 'Following'
+        params = {'userId': user_id, 'includePromotedContent': True, 'count': 1000}
+        following_dict = dict()
+
+        while True:
+            json_response = self.twitter_watcher.query(api_name, params)
+            following_list = find_all(json_response, 'user_results')
+            while not following_list and not find_one(json_response, 'result'):
+                import json
+                self.logger.error(json.dumps(json_response, indent=2))
+                time.sleep(10)
+                json_response = self.twitter_watcher.query(api_name, params)
+                following_list = find_all(json_response, 'user_results')
+
+            for following in following_list:
+                user_id = find_one(following, 'rest_id')
+                following_dict[user_id] = following
+
+            cursor = get_cursor(json_response)
+            if not cursor or cursor.startswith('-1|') or cursor.startswith('0|'):
+                break
+            params['cursor'] = cursor
+
+        return following_dict
+
+    def parse_user_details(self, user: dict) -> tuple[str, str | None]:
+        parser = ProfileParser(user)
+        details_str = 'Name: {}'.format(parser.name)
+        details_str += '\nBio: {}'.format(parser.bio)
+        details_str += '\nWebsite: {}'.format(parser.website)
+        details_str += '\nJoined at: {}'.format(parser.created_at)
+        details_str += '\nFollowing: {}'.format(parser.following_count)
+        details_str += '\nFollowers: {}'.format(parser.followers_count)
+        details_str += '\nTweets: {}'.format(parser.tweet_count)
+        return details_str, parser.profile_image_url
+
+    def _has_too_many_changes(self, old_following_dict: dict, new_following_dict: dict) -> bool:
+        max_changes = max(len(old_following_dict) / 2, 10)
+        dec_user_id_list = old_following_dict.keys() - new_following_dict.keys()
+        inc_user_id_list = new_following_dict.keys() - old_following_dict.keys()
+        return len(dec_user_id_list) > max_changes or len(inc_user_id_list) > max_changes
+
+    def detect_changes(self, old_following_dict: dict, new_following_dict: dict) -> None:
+        dec_user_id_list = old_following_dict.keys() - new_following_dict.keys()
+        inc_user_id_list = new_following_dict.keys() - old_following_dict.keys()
+        if dec_user_id_list:
+            self.logger.info('Unfollow: {}'.format(dec_user_id_list))
+            for dec_user_id in dec_user_id_list:
+                message = 'Unfollow: @{}'.format(find_one(old_following_dict[dec_user_id], 'screen_name'))
+                details_str, profile_image_url = self.parse_user_details(old_following_dict[dec_user_id])
+                if details_str:
+                    message += '\n{}'.format(details_str)
+                self.send_message(message=message, photo_url_list=[profile_image_url] if profile_image_url else [])
+        if inc_user_id_list:
+            self.logger.info('Follow: {}'.format(inc_user_id_list))
+            for inc_user_id in inc_user_id_list:
+                message = 'Follow: @{}'.format(find_one(new_following_dict[inc_user_id], 'screen_name'))
+                details_str, profile_image_url = self.parse_user_details(new_following_dict[inc_user_id])
+                if details_str:
+                    message += '\n{}'.format(details_str)
+                self.send_message(message=message, photo_url_list=[profile_image_url] if profile_image_url else [])
+
+    def watch(self) -> bool:
+        following_dict = self.get_all_following(self.user_id)
+        if self._has_too_many_changes(self.following_dict, following_dict):
+            return False
+        old_following_dict = self.following_dict
+        self.following_dict = following_dict
+        self.detect_changes(old_following_dict, following_dict)
+        self.update_last_watch_time()
+        return True
+
+    def status(self) -> str:
+        return 'Last: {}, number: {}'.format(self.get_last_watch_time(), len(self.following_dict))
