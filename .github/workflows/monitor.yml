@@ -23,6 +23,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          
+            # The rendered card mixes English and Chinese, so Pillow needs a CJK font.
+      - name: Install CJK font
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
 
       - name: Install dependencies
         run: |
