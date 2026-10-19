@@ -23,7 +23,7 @@ import hashlib
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -32,7 +32,8 @@ sys.path.insert(0, PROJ)
 os.chdir(PROJ)
 
 from twitter_watcher import TwitterWatcher
-from utils import find_all, find_one, parse_media_from_tweet, parse_text_from_tweet
+from utils import (find_all, find_one, parse_create_time_from_tweet,
+                   parse_media_from_tweet, parse_text_from_tweet)
 from webhook_notifier import WebhookMessage, WebhookNotifier
 
 STATE_PATH = os.path.join(PROJ, 'state.json')
@@ -91,6 +92,30 @@ def send_wecom_image(webhook: str, data: bytes) -> bool:
         print('image rejected: {}'.format(info))
         return False
     return True
+
+
+def expand_urls(tweet: dict, text: str) -> str:
+    """Replace t.co shorteners with the real target so the reader knows where
+    a link goes without having to open it (t.co itself is unreachable in CN)."""
+    for items in find_all(tweet, 'urls'):
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            short = item.get('url')
+            full = item.get('expanded_url')
+            if short and full and short in text:
+                text = text.replace(short, full)
+    return text
+
+
+def beijing_time(tweet: dict) -> str:
+    try:
+        created = parse_create_time_from_tweet(tweet)
+        return created.astimezone(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        return ''
 
 
 def main() -> int:
@@ -154,7 +179,7 @@ def main() -> int:
     elif fresh:
         WebhookNotifier.init(logger_name='webhook')
         for tid, tweet in fresh:
-            text = parse_text_from_tweet(tweet) or ''
+            text = expand_urls(tweet, parse_text_from_tweet(tweet) or '')
             photos, videos = parse_media_from_tweet(tweet)
 
             # Download first so that any photo we cannot embed can still be
@@ -168,12 +193,14 @@ def main() -> int:
                 else:
                     failed_urls.append(url)
 
-            body = '[{}] {}{}'.format(target, text[:900], '…' if len(text) > 900 else '')
+            stamp = beijing_time(tweet)
+            head = '[{}]{}'.format(target, ' ' + stamp if stamp else '')
+            body = '{}\n{}{}'.format(head, text[:900], '…' if len(text) > 900 else '')
             if failed_urls:
                 body += '\n' + '\n'.join(failed_urls)
             if videos:
                 body += '\n' + '\n'.join(videos[:2])
-            body += '\n\nLink: https://x.com/{}/status/{}'.format(target, tid)
+            body += '\n\nhttps://x.com/{}/status/{}'.format(target, tid)
 
             WebhookNotifier.send_message(WebhookMessage(url_list=[webhook], text=body))
             print('pushed {} ({} image(s) embedded)'.format(tid, len(image_blobs)))
