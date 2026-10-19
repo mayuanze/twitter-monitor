@@ -9,3 +9,4 @@ XClientTransaction>=1.0.3
 brotli
 setuptools<81
 urllib3<2
+Pillow>=10
