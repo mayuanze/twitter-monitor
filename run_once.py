@@ -10,6 +10,7 @@ Environment variables (set from repository secrets):
     X_CT0         ct0 cookie from the browser
     WEBHOOK_URL   WeCom / DingTalk / Feishu / PushPlus webhook
     TARGET_USER   X handle to watch (default: nikgeneburn)
+    STATE_FILE    high-water mark file (default: state.json); one per target
 
 First run only records a baseline: it will not flood the channel with history.
 
@@ -38,7 +39,7 @@ from utils import (find_all, find_one, parse_create_time_from_tweet,
 from tweet_card import expand_urls
 from webhook_notifier import WebhookMessage, WebhookNotifier
 
-STATE_PATH = os.path.join(PROJ, 'state.json')
+STATE_PATH = os.path.join(PROJ, os.environ.get('STATE_FILE', '').strip() or 'state.json')
 COOKIE_DIR = os.path.join(PROJ, 'cookies')
 
 # WeCom group bot: image messages take raw bytes <= 2MB, JPG/PNG only.
