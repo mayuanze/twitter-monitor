@@ -138,6 +138,63 @@ def original_text(tweet: dict, target: str, tid: str) -> str:
     return _fit_bytes('\n'.join(lines))
 
 
+def _cjk_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    cjk = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
+    return cjk / len(text)
+
+
+def translate(text: str, lang: str = 'zh-CN') -> str:
+    """Translate with the free Google web endpoint: no API key required."""
+    if not text.strip():
+        return ''
+    if _cjk_ratio(text) > 0.3:
+        return ''  # already Chinese, nothing to do
+    endpoints = [
+        'https://translate.googleapis.com/translate_a/single',
+        'https://translate.google.com/translate_a/single',
+    ]
+    for endpoint in endpoints:
+        try:
+            response = requests.get(endpoint, params={
+                'client': 'gtx', 'sl': 'auto', 'tl': lang, 'dt': 't',
+                'q': text[:1800],
+            }, timeout=30)
+            data = response.json()
+            return ''.join(part[0] for part in data[0] if part and part[0]).strip()
+        except Exception as e:
+            print('translate via {} failed: {}'.format(endpoint.split('/')[2], e))
+    return ''
+
+
+def translated_text(tweet: dict, target: str, tid: str) -> str:
+    """Chinese rendering of the tweet. Empty string means 'do not send one'."""
+    original = expand_urls(tweet, parse_text_from_tweet(tweet) or '').strip()
+    body = translate(original)
+    if not body:
+        return ''
+    if body.strip() == original.strip():
+        return ''  # a bare link or untranslatable text: a duplicate adds nothing
+
+    stamp = beijing_time(tweet)
+    lines = ['译文 @{}{}'.format(target, ' · ' + stamp if stamp else ''), '', body]
+
+    quoted = find_one(tweet, 'quoted_status_result')
+    if isinstance(quoted, dict):
+        quoted = quoted.get('result') or quoted
+        if isinstance(quoted, dict):
+            author = find_one(quoted, 'user_results')
+            core = find_one(author, 'core') or {}
+            qhandle = core.get('screen_name') or ''
+            qtext = translate(expand_urls(quoted, parse_text_from_tweet(quoted) or '').strip())
+            if qtext:
+                lines += ['', '【引用 @{}】'.format(qhandle), qtext]
+
+    lines += ['', 'https://x.com/{}/status/{}'.format(target, tid)]
+    return _fit_bytes('\n'.join(lines))
+
+
 def main() -> int:
     username = need('X_USERNAME')
     auth_token = need('X_AUTH_TOKEN')
@@ -213,6 +270,14 @@ def main() -> int:
                 WebhookNotifier.send_message(WebhookMessage(
                     url_list=[webhook], text=original_text(tweet, target, tid)))
                 print('  original text sent')
+
+                translation = translated_text(tweet, target, tid)
+                if translation:
+                    WebhookNotifier.send_message(WebhookMessage(
+                        url_list=[webhook], text=translation))
+                    print('  translation sent')
+                else:
+                    print('  translation skipped (already Chinese, unchanged, or failed)')
                 continue
 
             # Fallback: plain text plus the photos as separate image messages.
