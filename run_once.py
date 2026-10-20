@@ -36,6 +36,7 @@ import tweet_card
 from twitter_watcher import TwitterWatcher
 from utils import (find_all, find_one, parse_create_time_from_tweet,
                    parse_media_from_tweet, parse_text_from_tweet)
+from qq_notifier import QQGroupNotifier
 from tweet_card import expand_urls
 from webhook_notifier import WebhookMessage, WebhookNotifier
 
@@ -272,6 +273,16 @@ def main() -> int:
     webhook = need('WEBHOOK_URL')
     target = os.environ.get('TARGET_USER', '').strip() or 'nikgeneburn'
 
+    # QQ group is optional: skip silently when any of the three values is absent.
+    qq_app_id = os.environ.get('QQ_APP_ID', '').strip()
+    qq_app_secret = os.environ.get('QQ_APP_SECRET', '').strip()
+    qq_group = os.environ.get('QQ_GROUP_OPENID', '').strip()
+    qq_sender = None
+    if qq_app_id and qq_app_secret and qq_group:
+        qq_sender = QQGroupNotifier(qq_app_id, qq_app_secret, qq_group)
+    else:
+        print('qq group disabled: QQ_APP_ID / QQ_APP_SECRET / QQ_GROUP_OPENID not all set')
+
     os.makedirs(COOKIE_DIR, exist_ok=True)
     with open(os.path.join(COOKIE_DIR, '{}.json'.format(username)), 'w', encoding='utf-8') as f:
         json.dump({'auth_token': auth_token, 'ct0': ct0}, f)
@@ -326,6 +337,9 @@ def main() -> int:
     elif fresh:
         WebhookNotifier.init(logger_name='webhook')
         for tid, tweet in fresh:
+            text_body = original_text(tweet, target, tid)
+            translation = translated_text(tweet, target, tid)
+
             # Preferred output: one screenshot-style card image that already
             # contains avatar, text, media, quoted tweet and engagement counts.
             card = None
@@ -338,48 +352,50 @@ def main() -> int:
                 print('pushed {} as card ({} KB)'.format(tid, len(card) // 1024))
                 # Also send the plain text so it can be copied on a phone.
                 WebhookNotifier.send_message(WebhookMessage(
-                    url_list=[webhook], text=original_text(tweet, target, tid)))
+                    url_list=[webhook], text=text_body))
                 print('  original text sent')
-
-                translation = translated_text(tweet, target, tid)
                 if translation:
                     WebhookNotifier.send_message(WebhookMessage(
                         url_list=[webhook], text=translation))
                     print('  translation sent')
                 else:
                     print('  translation skipped (already Chinese, unchanged, or failed)')
-                continue
+            else:
+                # Fallback: plain text plus the photos as separate image messages.
+                photos, videos = parse_media_from_tweet(tweet)
+                image_blobs = []
+                failed_urls = []
+                for url in photos[:MAX_PHOTOS]:
+                    blob = download_image(url)
+                    if blob:
+                        image_blobs.append(blob)
+                    else:
+                        failed_urls.append(url)
 
-            # Fallback: plain text plus the photos as separate image messages.
-            text = expand_urls(tweet, parse_text_from_tweet(tweet) or '')
-            photos, videos = parse_media_from_tweet(tweet)
+                body = text_body
+                if failed_urls:
+                    body += '\n' + '\n'.join(failed_urls)
+                if videos:
+                    body += '\n' + '\n'.join(videos[:2])
 
-            image_blobs = []
-            failed_urls = []
-            for url in photos[:MAX_PHOTOS]:
-                blob = download_image(url)
-                if blob:
-                    image_blobs.append(blob)
+                WebhookNotifier.send_message(WebhookMessage(url_list=[webhook], text=body))
+                print('pushed {} as text ({} image(s) embedded)'.format(tid, len(image_blobs)))
+
+                for blob in image_blobs:
+                    if send_wecom_image(webhook, blob):
+                        print('  image sent ({} KB)'.format(len(blob) // 1024))
+                    else:
+                        print('  image skipped (not WeCom, or rejected)')
+
+            # QQ group gets text only: rich media would need the PNG uploaded
+            # to QQ's file API first, and the card has no public URL.
+            if qq_sender is not None:
+                if qq_sender.send(text_body):
+                    print('  qq group: original sent')
                 else:
-                    failed_urls.append(url)
-
-            stamp = beijing_time(tweet)
-            head = '[{}]{}'.format(target, ' ' + stamp if stamp else '')
-            body = '{}\n{}{}'.format(head, text[:900], '…' if len(text) > 900 else '')
-            if failed_urls:
-                body += '\n' + '\n'.join(failed_urls)
-            if videos:
-                body += '\n' + '\n'.join(videos[:2])
-            body += '\n\nhttps://x.com/{}/status/{}'.format(target, tid)
-
-            WebhookNotifier.send_message(WebhookMessage(url_list=[webhook], text=body))
-            print('pushed {} as text ({} image(s) embedded)'.format(tid, len(image_blobs)))
-
-            for blob in image_blobs:
-                if send_wecom_image(webhook, blob):
-                    print('  image sent ({} KB)'.format(len(blob) // 1024))
-                else:
-                    print('  image skipped (not WeCom, or rejected)')
+                    print('  qq group: original failed')
+                if translation and qq_sender.send(translation):
+                    print('  qq group: translation sent')
 
     with open(STATE_PATH, 'w', encoding='utf-8') as f:
         json.dump({
