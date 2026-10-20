@@ -61,6 +61,9 @@ jobs:
           X_AUTH_TOKEN: ${{ secrets.X_AUTH_TOKEN }}
           X_CT0: ${{ secrets.X_CT0 }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          QQ_APP_ID: ${{ secrets.QQ_APP_ID }}
+          QQ_APP_SECRET: ${{ secrets.QQ_APP_SECRET }}
+          QQ_GROUP_OPENID: ${{ secrets.QQ_GROUP_OPENID }}
           TARGET_USER: ${{ matrix.target }}
           STATE_FILE: ${{ matrix.state }}
         run: python run_once.py
