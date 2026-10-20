@@ -36,7 +36,12 @@ import tweet_card
 from twitter_watcher import TwitterWatcher
 from utils import (find_all, find_one, parse_create_time_from_tweet,
                    parse_media_from_tweet, parse_text_from_tweet)
-from qq_notifier import QQGroupNotifier
+try:
+    # Optional channel. Guarded so the repo keeps working even when this file
+    # is absent: a bare import would raise ImportError and fail the whole run.
+    from mail_notifier import MailNotifier
+except ImportError:
+    MailNotifier = None
 from tweet_card import expand_urls
 from webhook_notifier import WebhookMessage, WebhookNotifier
 
@@ -273,15 +278,19 @@ def main() -> int:
     webhook = need('WEBHOOK_URL')
     target = os.environ.get('TARGET_USER', '').strip() or 'nikgeneburn'
 
-    # QQ group is optional: skip silently when any of the three values is absent.
-    qq_app_id = os.environ.get('QQ_APP_ID', '').strip()
-    qq_app_secret = os.environ.get('QQ_APP_SECRET', '').strip()
-    qq_group = os.environ.get('QQ_GROUP_OPENID', '').strip()
-    qq_sender = None
-    if qq_app_id and qq_app_secret and qq_group:
-        qq_sender = QQGroupNotifier(qq_app_id, qq_app_secret, qq_group)
+    # Optional second channel: email. Off unless MAIL_USER / MAIL_AUTH_CODE are
+    # both provided AND mail_notifier.py exists in the repo.
+    mail_user = os.environ.get('MAIL_USER', '').strip()
+    mail_code = os.environ.get('MAIL_AUTH_CODE', '').strip()
+    mail_to = os.environ.get('MAIL_TO', '').strip()
+    mailer = None
+    if mail_user and mail_code:
+        if MailNotifier is None:
+            print('mail skipped: mail_notifier.py not found in the repo')
+        else:
+            mailer = MailNotifier(mail_user, mail_code, mail_to)
     else:
-        print('qq group disabled: QQ_APP_ID / QQ_APP_SECRET / QQ_GROUP_OPENID not all set')
+        print('mail disabled: MAIL_USER / MAIL_AUTH_CODE not set')
 
     os.makedirs(COOKIE_DIR, exist_ok=True)
     with open(os.path.join(COOKIE_DIR, '{}.json'.format(username)), 'w', encoding='utf-8') as f:
@@ -387,15 +396,17 @@ def main() -> int:
                     else:
                         print('  image skipped (not WeCom, or rejected)')
 
-            # QQ group gets text only: rich media would need the PNG uploaded
-            # to QQ's file API first, and the card has no public URL.
-            if qq_sender is not None:
-                if qq_sender.send(text_body):
-                    print('  qq group: original sent')
+            # Email: one mail per tweet, card inlined, original + translation
+            # in the body. Independent of WeCom, so it still fires when the
+            # card render failed (image is then simply omitted).
+            if mailer is not None:
+                stamp = beijing_time(tweet)
+                subject = '[{}] 新推文{}'.format(
+                    target, ' · ' + stamp if stamp else '')
+                if mailer.send_tweet(subject, text_body, translation, card or b''):
+                    print('  mail sent')
                 else:
-                    print('  qq group: original failed')
-                if translation and qq_sender.send(translation):
-                    print('  qq group: translation sent')
+                    print('  mail failed')
 
     with open(STATE_PATH, 'w', encoding='utf-8') as f:
         json.dump({
