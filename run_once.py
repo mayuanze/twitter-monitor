@@ -271,6 +271,86 @@ def translated_text(tweet: dict, target: str, tid: str) -> str:
     return _fit_bytes('\n'.join(lines))
 
 
+def save_state(last_id: int, target: str) -> None:
+    """Persist the high-water mark immediately.
+
+    This used to run once after the whole backlog loop. If any tweet raised,
+    the write never happened, last_id stayed frozen, and the next run re-pushed
+    the exact same tweets — forever. Writing after every tweet makes a crash
+    cost at most one tweet instead of replaying the entire backlog.
+    """
+    with open(STATE_PATH, 'w', encoding='utf-8') as f:
+        json.dump({
+            'last_id': last_id,
+            'target': target,
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }, f, indent=2)
+
+
+def push_one(tweet: dict, tid: int, target: str, webhook: str, mailer) -> None:
+    """Push a single tweet to every enabled channel."""
+    text_body = original_text(tweet, target, tid)
+    translation = translated_text(tweet, target, tid)
+
+    # Preferred output: one screenshot-style card image that already
+    # contains avatar, text, media, quoted tweet and engagement counts.
+    card = None
+    try:
+        card = tweet_card.render_card(tweet, target)
+    except Exception as e:
+        print('card render failed for {}: {}'.format(tid, e))
+
+    if card and send_wecom_image(webhook, card):
+        print('pushed {} as card ({} KB)'.format(tid, len(card) // 1024))
+        # Also send the plain text so it can be copied on a phone.
+        WebhookNotifier.send_message(WebhookMessage(
+            url_list=[webhook], text=text_body))
+        print('  original text sent')
+        if translation:
+            WebhookNotifier.send_message(WebhookMessage(
+                url_list=[webhook], text=translation))
+            print('  translation sent')
+        else:
+            print('  translation skipped (already Chinese, unchanged, or failed)')
+    else:
+        # Fallback: plain text plus the photos as separate image messages.
+        photos, videos = parse_media_from_tweet(tweet)
+        image_blobs = []
+        failed_urls = []
+        for url in photos[:MAX_PHOTOS]:
+            blob = download_image(url)
+            if blob:
+                image_blobs.append(blob)
+            else:
+                failed_urls.append(url)
+
+        body = text_body
+        if failed_urls:
+            body += '\n' + '\n'.join(failed_urls)
+        if videos:
+            body += '\n' + '\n'.join(videos[:2])
+
+        WebhookNotifier.send_message(WebhookMessage(url_list=[webhook], text=body))
+        print('pushed {} as text ({} image(s) embedded)'.format(tid, len(image_blobs)))
+
+        for blob in image_blobs:
+            if send_wecom_image(webhook, blob):
+                print('  image sent ({} KB)'.format(len(blob) // 1024))
+            else:
+                print('  image skipped (not WeCom, or rejected)')
+
+    # Email: one mail per tweet, card inlined, original + translation in the
+    # body. Independent of WeCom, so it still fires when the card render failed
+    # (the image is then simply omitted).
+    if mailer is not None:
+        stamp = beijing_time(tweet)
+        subject = '[{}] 新推文{}'.format(target, ' · ' + stamp if stamp else '')
+        if mailer.send_tweet(subject, text_body, translation, card or b''):
+            print('  mail sent')
+        else:
+            print('  mail failed')
+
+
 def main() -> int:
     username = need('X_USERNAME')
     auth_token = need('X_AUTH_TOKEN')
@@ -346,74 +426,18 @@ def main() -> int:
     elif fresh:
         WebhookNotifier.init(logger_name='webhook')
         for tid, tweet in fresh:
-            text_body = original_text(tweet, target, tid)
-            translation = translated_text(tweet, target, tid)
-
-            # Preferred output: one screenshot-style card image that already
-            # contains avatar, text, media, quoted tweet and engagement counts.
-            card = None
+            # One bad tweet must not kill the run: catch it, log it, move on.
             try:
-                card = tweet_card.render_card(tweet, target)
+                push_one(tweet, tid, target, webhook, mailer)
             except Exception as e:
-                print('card render failed for {}: {}'.format(tid, e))
+                print('tweet {} failed: {}: {}'.format(tid, type(e).__name__, e))
+            finally:
+                # Advance even when the push failed. Replaying a broken tweet
+                # every 5 minutes is worse than dropping it.
+                save_state(tid, target)
+                print('state saved: last_id={}'.format(tid))
 
-            if card and send_wecom_image(webhook, card):
-                print('pushed {} as card ({} KB)'.format(tid, len(card) // 1024))
-                # Also send the plain text so it can be copied on a phone.
-                WebhookNotifier.send_message(WebhookMessage(
-                    url_list=[webhook], text=text_body))
-                print('  original text sent')
-                if translation:
-                    WebhookNotifier.send_message(WebhookMessage(
-                        url_list=[webhook], text=translation))
-                    print('  translation sent')
-                else:
-                    print('  translation skipped (already Chinese, unchanged, or failed)')
-            else:
-                # Fallback: plain text plus the photos as separate image messages.
-                photos, videos = parse_media_from_tweet(tweet)
-                image_blobs = []
-                failed_urls = []
-                for url in photos[:MAX_PHOTOS]:
-                    blob = download_image(url)
-                    if blob:
-                        image_blobs.append(blob)
-                    else:
-                        failed_urls.append(url)
-
-                body = text_body
-                if failed_urls:
-                    body += '\n' + '\n'.join(failed_urls)
-                if videos:
-                    body += '\n' + '\n'.join(videos[:2])
-
-                WebhookNotifier.send_message(WebhookMessage(url_list=[webhook], text=body))
-                print('pushed {} as text ({} image(s) embedded)'.format(tid, len(image_blobs)))
-
-                for blob in image_blobs:
-                    if send_wecom_image(webhook, blob):
-                        print('  image sent ({} KB)'.format(len(blob) // 1024))
-                    else:
-                        print('  image skipped (not WeCom, or rejected)')
-
-            # Email: one mail per tweet, card inlined, original + translation
-            # in the body. Independent of WeCom, so it still fires when the
-            # card render failed (image is then simply omitted).
-            if mailer is not None:
-                stamp = beijing_time(tweet)
-                subject = '[{}] 新推文{}'.format(
-                    target, ' · ' + stamp if stamp else '')
-                if mailer.send_tweet(subject, text_body, translation, card or b''):
-                    print('  mail sent')
-                else:
-                    print('  mail failed')
-
-    with open(STATE_PATH, 'w', encoding='utf-8') as f:
-        json.dump({
-            'last_id': max_id,
-            'target': target,
-            'updated_at': datetime.now(timezone.utc).isoformat(),
-        }, f, indent=2)
+    save_state(max_id, target)
     print('state saved: last_id={}'.format(max_id))
     return 0
 
